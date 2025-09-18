@@ -2,10 +2,18 @@ import os
 import asyncio
 from aiogram import Bot, Dispatcher, executor, types
 from dotenv import load_dotenv
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import datetime
 
-# Загружаем токен
+# Загружаем токены и ID из .env
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не найден. Проверь файл .env")
 
@@ -18,7 +26,37 @@ def is_allowed(message: types.Message) -> bool:
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
-# Запуск ffmpeg
+# --- Авторизация в Google API ---
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+
+drive_service = build("drive", "v3", credentials=creds)
+gc = gspread.authorize(creds)
+sheet = gc.open_by_key(GOOGLE_SHEETS_ID).worksheet("videos")  # вкладка "videos" в таблице
+
+def upload_to_drive(file_path, filename):
+    """Загрузить файл в Google Drive и вернуть ссылку"""
+    file_metadata = {
+        "name": filename,
+        "parents": [GOOGLE_DRIVE_FOLDER_ID]
+    }
+    media = MediaFileUpload(file_path, mimetype="video/mp4")
+    file = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink"
+    ).execute()
+    return file.get("webViewLink")
+
+def add_row_to_sheet(video_id, version, link, title, hashtags, profile, social, status="готово"):
+    """Добавить строку в Google Sheets"""
+    today = datetime.datetime.now().strftime("%d.%m.%Y")
+    sheet.append_row([video_id, version, today, link, title, "", hashtags, profile, social, status])
+
+# --- Вспомогательная функция для ffmpeg ---
 async def run_ffmpeg(cmd):
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -29,7 +67,7 @@ async def run_ffmpeg(cmd):
     if process.returncode != 0:
         print("FFmpeg error:", stderr.decode())
 
-# /start
+# --- /start ---
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     if not is_allowed(message):
@@ -37,15 +75,10 @@ async def start_cmd(message: types.Message):
         return
     await message.reply(
         "✅ Бот работает.\n"
-        "Пришлите видео (до 20МБ). Я верну 5 версий:\n"
-        "1) Warm LUT + 25fps + speed 1.1\n"
-        "2) Cold LUT + 30fps + speed 1.2\n"
-        "3) Neutral LUT + 50fps + speed 1.3\n"
-        "4) Zoom + статичная полоска + speed 1.05\n"
-        "5) Rotate + saturation + speed 1.0"
+        "Пришлите видео (до 20МБ). Я сделаю 5 версий, отправлю их сюда и запишу в Google Drive + Google Sheets."
     )
 
-# Обработка видео
+# --- Обработка видео ---
 @dp.message_handler(content_types=[types.ContentType.VIDEO, types.ContentType.DOCUMENT])
 async def handle_video(message: types.Message):
     if not is_allowed(message):
@@ -64,7 +97,7 @@ async def handle_video(message: types.Message):
 
     outputs = []
 
-    # Версия 1 — Warm LUT + 25fps + speed 1.1
+    # Версия 1
     out1 = f"warm_25fps_{file_name}"
     cmd1 = [
         "ffmpeg", "-y", "-i", input_path,
@@ -77,7 +110,7 @@ async def handle_video(message: types.Message):
     await run_ffmpeg(cmd1)
     outputs.append(("🔥 Warm LUT + 25fps + 1.1x", out1))
 
-    # Версия 2 — Cold LUT + 30fps + speed 1.2
+    # Версия 2
     out2 = f"cold_30fps_{file_name}"
     cmd2 = [
         "ffmpeg", "-y", "-i", input_path,
@@ -90,7 +123,7 @@ async def handle_video(message: types.Message):
     await run_ffmpeg(cmd2)
     outputs.append(("❄️ Cold LUT + 30fps + 1.2x", out2))
 
-    # Версия 3 — Neutral LUT + 50fps + speed 1.3
+    # Версия 3
     out3 = f"neutral_50fps_{file_name}"
     cmd3 = [
         "ffmpeg", "-y", "-i", input_path,
@@ -103,7 +136,7 @@ async def handle_video(message: types.Message):
     await run_ffmpeg(cmd3)
     outputs.append(("⚖️ Neutral LUT + 50fps + 1.3x", out3))
 
-    # Версия 4 — Zoom + статичная полоска + speed 1.05
+    # Версия 4
     out4 = f"zoom_bar_{file_name}"
     cmd4 = [
         "ffmpeg", "-y", "-i", input_path,
@@ -118,7 +151,7 @@ async def handle_video(message: types.Message):
     await run_ffmpeg(cmd4)
     outputs.append(("🔎 Zoom + red bar + 1.05x", out4))
 
-    # Версия 5 — Rotate + saturation + speed 1.0
+    # Версия 5
     out5 = f"rotate_sat_{file_name}"
     cmd5 = [
         "ffmpeg", "-y", "-i", input_path,
@@ -132,11 +165,28 @@ async def handle_video(message: types.Message):
     await run_ffmpeg(cmd5)
     outputs.append(("⏱ Rotate + saturation + 1.0x", out5))
 
-    # Отправляем все версии
-    for caption, path in outputs:
+    # Отправляем + загружаем в Drive + пишем в Sheets
+    for idx, (caption, path) in enumerate(outputs, start=1):
         if os.path.exists(path) and os.path.getsize(path) > 0:
+            # 1. Отправка в Telegram
             with open(path, "rb") as video:
                 await message.reply_video(video, caption=caption)
+
+            # 2. Загрузка в Google Drive
+            drive_link = upload_to_drive(path, os.path.basename(path))
+
+            # 3. Запись в Google Sheets (по одной строке на соцсеть)
+            for social in ["TikTok", "YouTube Shorts", "VK Видео"]:
+                add_row_to_sheet(
+                    video_id=message.message_id,
+                    version=f"V{idx}",
+                    link=drive_link,
+                    title=caption,
+                    hashtags="#skincare #beauty",
+                    profile=f"Профиль {idx}",
+                    social=social,
+                    status="готово"
+                )
         else:
             await message.reply(f"⚠️ Ошибка: файл {path} пустой или не создан.")
 
